@@ -1,40 +1,78 @@
 import pickle
-from functools import lru_cache
 
 import faiss
 
-from rag.config import CHUNKS_PATH, INDEX_PATH
+from rag.config import get_book_config
 
 
-@lru_cache(maxsize=1)
-def load_vectorstore():
-    if not INDEX_PATH.exists():
+# Cache simple pour éviter de recharger plusieurs fois
+# la même base vectorielle pendant l'exécution.
+_DATABASE_CACHE: dict[str, tuple] = {}
+
+
+def load_vectorstore(book_id: str):
+    """
+    Charge l'index FAISS et les passages du livre sélectionné.
+    """
+
+    if book_id in _DATABASE_CACHE:
+        return _DATABASE_CACHE[book_id]
+
+    book_config = get_book_config(book_id)
+
+    index_path = book_config["index"]
+    chunks_path = book_config["chunks"]
+
+    if not index_path.exists():
         raise FileNotFoundError(
-            f"Index FAISS absent : {INDEX_PATH}. "
-            "Exécutez d’abord python build_database.py."
+            f"Index FAISS introuvable pour {book_config['label']}.\n"
+            f"Exécutez : python build_database.py {book_id}"
         )
 
-    if not CHUNKS_PATH.exists():
+    if not chunks_path.exists():
         raise FileNotFoundError(
-            f"Métadonnées absentes : {CHUNKS_PATH}. "
-            "Exécutez d’abord python build_database.py."
+            f"Fichier chunks.pkl introuvable pour "
+            f"{book_config['label']}.\n"
+            f"Exécutez : python build_database.py {book_id}"
         )
 
-    if INDEX_PATH.stat().st_size == 0 or CHUNKS_PATH.stat().st_size == 0:
+    if index_path.stat().st_size == 0:
         raise ValueError(
-            "La base vectorielle est vide. "
-            "Exécutez de nouveau build_database.py."
+            f"L'index FAISS de {book_config['label']} est vide."
         )
 
-    index = faiss.read_index(str(INDEX_PATH))
+    if chunks_path.stat().st_size == 0:
+        raise ValueError(
+            f"Le fichier chunks.pkl de "
+            f"{book_config['label']} est vide."
+        )
 
-    with CHUNKS_PATH.open("rb") as file:
+    index = faiss.read_index(
+        str(index_path)
+    )
+
+    with chunks_path.open("rb") as file:
         chunks = pickle.load(file)
 
     if index.ntotal != len(chunks):
         raise ValueError(
-            "L’index FAISS et les passages ne correspondent pas. "
-            "Reconstruisez la base."
+            f"L'index FAISS et les passages de "
+            f"{book_config['label']} ne correspondent pas.\n"
+            f"Reconstruisez la base avec : "
+            f"python build_database.py {book_id}"
         )
 
+    _DATABASE_CACHE[book_id] = (
+        index,
+        chunks,
+    )
+
     return index, chunks
+
+
+def clear_database_cache() -> None:
+    """
+    Vide le cache des bases vectorielles.
+    """
+
+    _DATABASE_CACHE.clear()
