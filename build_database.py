@@ -1,108 +1,93 @@
-import os
+import argparse
 import pickle
 from pathlib import Path
 
 import faiss
 import numpy as np
-from dotenv import load_dotenv
-from openai import OpenAI
 from pypdf import PdfReader
 
+from rag.config import (
+    DATA_DIR,
+    EMBEDDING_DEPLOYMENT,
+    VECTORSTORE_DIR,
+)
+from rag.openai_client import get_openai_client
 
-load_dotenv()
 
-AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-EMBEDDING_DEPLOYMENT = os.getenv("EMBEDDING_DEPLOYMENT")
+def normalize_book_id(value: str) -> str:
+    return value.strip().lower().replace(" ", "").replace("-", "")
 
-BASE_DIR = Path(__file__).resolve().parent
 
-PDF_PATH = BASE_DIR / "data" / "dora.pdf"
+def get_paths(book_id: str) -> tuple[Path, Path, Path]:
+    pdf_path = DATA_DIR / f"{book_id}.pdf"
+    book_directory = VECTORSTORE_DIR / book_id
+    index_path = book_directory / "index.faiss"
+    chunks_path = book_directory / "chunks.pkl"
 
-VECTORSTORE_DIR = BASE_DIR / "vectorstore"
-INDEX_PATH = VECTORSTORE_DIR / "dora_index.faiss"
-CHUNKS_PATH = VECTORSTORE_DIR / "dora_chunks.pkl"
+    return pdf_path, index_path, chunks_path
 
 
 def split_text(
     text: str,
-    chunk_size: int = 1800,
+    chunk_size: int = 1600,
     overlap: int = 250,
 ) -> list[str]:
-    """
-    Découpe le texte en passages avec un chevauchement.
-    """
-
     chunks = []
     start = 0
+    step = chunk_size - overlap
 
     while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end].strip()
+        chunk = text[start : start + chunk_size].strip()
 
         if chunk:
             chunks.append(chunk)
 
-        start += chunk_size - overlap
+        start += step
 
     return chunks
 
 
-def create_client() -> OpenAI:
-    """
-    Crée le client Azure OpenAI.
-    """
-
-    if not AZURE_ENDPOINT:
-        raise ValueError(
-            "AZURE_OPENAI_ENDPOINT est absent du fichier .env."
-        )
-
-    if not AZURE_API_KEY:
-        raise ValueError(
-            "AZURE_OPENAI_API_KEY est absent du fichier .env."
-        )
-
-    if not EMBEDDING_DEPLOYMENT:
-        raise ValueError(
-            "EMBEDDING_DEPLOYMENT est absent du fichier .env."
-        )
-
-    return OpenAI(
-        api_key=AZURE_API_KEY,
-        base_url=f"{AZURE_ENDPOINT}/openai/v1/",
-    )
-
-
-def extract_chunks() -> list[dict]:
-    """
-    Lit le PDF et crée les passages avec leurs numéros de page.
-    """
-
-    if not PDF_PATH.exists():
+def extract_chunks(
+    pdf_path: Path,
+    book_id: str,
+) -> list[dict]:
+    if not pdf_path.exists():
         raise FileNotFoundError(
-            f"Le fichier PDF est introuvable : {PDF_PATH}"
+            f"PDF introuvable : {pdf_path}\n"
+            f"Ajoute le fichier data/{book_id}.pdf."
         )
 
-    print(f"Lecture du PDF : {PDF_PATH}")
+    if pdf_path.stat().st_size == 0:
+        raise ValueError(
+            f"Le fichier {pdf_path.name} est vide."
+        )
 
-    reader = PdfReader(str(PDF_PATH))
+    reader = PdfReader(str(pdf_path))
     chunks = []
 
-    for page_number, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
+    print(
+        f"Lecture de {pdf_path.name} "
+        f"({len(reader.pages)} pages)..."
+    )
 
-        if not text.strip():
+    for page_number, page in enumerate(
+        reader.pages,
+        start=1,
+    ):
+        text = (page.extract_text() or "").strip()
+
+        if not text:
             print(
-                f"Avertissement : aucun texte extrait de la page {page_number}."
+                f"Page {page_number} : "
+                "aucun texte détecté."
             )
             continue
 
-        page_chunks = split_text(text)
-
-        for passage in page_chunks:
+        for passage in split_text(text):
             chunks.append(
                 {
+                    "book_id": book_id,
+                    "document": pdf_path.name,
                     "page": page_number,
                     "text": passage,
                 }
@@ -110,34 +95,37 @@ def extract_chunks() -> list[dict]:
 
     if not chunks:
         raise ValueError(
-            "Aucun texte n'a été extrait du PDF. "
-            "Le document est peut-être composé uniquement d'images."
+            "Aucun texte n'a été extrait. "
+            "Le PDF est peut-être composé d'images."
         )
-
-    print(f"{len(chunks)} passages créés.")
 
     return chunks
 
 
 def create_embeddings(
     chunks: list[dict],
-    client: OpenAI,
-    batch_size: int = 50,
+    batch_size: int = 32,
 ) -> np.ndarray:
-    """
-    Crée les embeddings Azure pour tous les passages.
-    """
+    client = get_openai_client()
+    vectors = []
 
     print("Création des embeddings Azure...")
 
-    vectors = []
-
-    for position in range(0, len(chunks), batch_size):
-        batch = chunks[position : position + batch_size]
+    for start in range(
+        0,
+        len(chunks),
+        batch_size,
+    ):
+        batch = chunks[
+            start : start + batch_size
+        ]
 
         response = client.embeddings.create(
             model=EMBEDDING_DEPLOYMENT,
-            input=[item["text"] for item in batch],
+            input=[
+                item["text"]
+                for item in batch
+            ],
         )
 
         vectors.extend(
@@ -146,23 +134,24 @@ def create_embeddings(
         )
 
         completed = min(
-            position + batch_size,
+            start + batch_size,
             len(chunks),
         )
 
         print(
-            f"{completed}/{len(chunks)} passages traités."
+            f"{completed}/{len(chunks)} "
+            "passages traités."
         )
 
-    if not vectors:
-        raise ValueError(
-            "Aucun embedding n'a été créé."
-        )
-
-    matrix = np.array(
+    matrix = np.asarray(
         vectors,
         dtype="float32",
     )
+
+    if matrix.size == 0:
+        raise ValueError(
+            "Aucun embedding n'a été créé."
+        )
 
     return matrix
 
@@ -170,12 +159,10 @@ def create_embeddings(
 def save_vectorstore(
     matrix: np.ndarray,
     chunks: list[dict],
+    index_path: Path,
+    chunks_path: Path,
 ) -> None:
-    """
-    Crée et enregistre l'index FAISS et les métadonnées.
-    """
-
-    VECTORSTORE_DIR.mkdir(
+    index_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
@@ -190,64 +177,97 @@ def save_vectorstore(
 
     faiss.write_index(
         index,
-        str(INDEX_PATH),
+        str(index_path),
     )
 
-    with open(CHUNKS_PATH, "wb") as file:
+    with chunks_path.open("wb") as file:
         pickle.dump(
             chunks,
             file,
         )
 
-    if not INDEX_PATH.exists():
-        raise FileNotFoundError(
-            "L'index FAISS n'a pas été créé."
-        )
-
-    if INDEX_PATH.stat().st_size == 0:
+    if index_path.stat().st_size == 0:
         raise ValueError(
             "L'index FAISS créé est vide."
         )
 
-    if not CHUNKS_PATH.exists():
-        raise FileNotFoundError(
-            "Le fichier des passages n'a pas été créé."
-        )
-
-    if CHUNKS_PATH.stat().st_size == 0:
+    if chunks_path.stat().st_size == 0:
         raise ValueError(
-            "Le fichier des passages créé est vide."
+            "Le fichier chunks.pkl créé est vide."
         )
 
 
-def main() -> None:
-    """
-    Construit la base vectorielle à partir du livre DORA.
-    """
+def build_book(book_id: str) -> None:
+    pdf_path, index_path, chunks_path = get_paths(
+        book_id
+    )
 
-    print("Démarrage de la construction de la base DORA...")
+    print()
+    print(
+        f"Construction de la base : {book_id}"
+    )
+    print(
+        f"PDF : {pdf_path}"
+    )
 
-    client = create_client()
+    chunks = extract_chunks(
+        pdf_path=pdf_path,
+        book_id=book_id,
+    )
 
-    chunks = extract_chunks()
+    print(
+        f"{len(chunks)} passages créés."
+    )
 
     matrix = create_embeddings(
-        chunks,
-        client,
+        chunks
     )
 
     save_vectorstore(
-        matrix,
-        chunks,
+        matrix=matrix,
+        chunks=chunks,
+        index_path=index_path,
+        chunks_path=chunks_path,
     )
 
     print()
     print("Base créée avec succès.")
-    print(f"PDF : {PDF_PATH}")
-    print(f"Index : {INDEX_PATH}")
-    print(f"Passages : {CHUNKS_PATH}")
-    print(f"Nombre de passages : {len(chunks)}")
-    print(f"Dimension des embeddings : {matrix.shape[1]}")
+    print(f"Index : {index_path}")
+    print(f"Passages : {chunks_path}")
+    print(
+        f"Dimension : {matrix.shape[1]}"
+    )
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Construit l'index FAISS "
+            "d'un livre PDF."
+        )
+    )
+
+    parser.add_argument(
+        "book",
+        help=(
+            "Nom du livre sans extension. "
+            "Exemples : dora ou iso27001"
+        ),
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_arguments()
+
+    book_id = normalize_book_id(
+        args.book
+    )
+
+    build_book(
+        book_id
+    )
 
 
 if __name__ == "__main__":
