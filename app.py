@@ -1,155 +1,356 @@
-import os
-import pickle
-from pathlib import Path
+import time
 
-import faiss
-import numpy as np
 import streamlit as st
-from dotenv import load_dotenv
-from openai import OpenAI
+
+from rag.citations import build_references
+from rag.config import (
+    APP_NAME,
+    CHUNKS_PATH,
+    INDEX_PATH,
+    LOGO_PATH,
+    PDF_PATH,
+    STYLE_PATH,
+)
+from rag.database import load_vectorstore
+from rag.generator import generate_answer
+from rag.openai_client import get_openai_client
+from rag.retriever import retrieve_passages
 
 
-load_dotenv()
-
-AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-CHAT_DEPLOYMENT = os.getenv("CHAT_DEPLOYMENT")
-EMBEDDING_DEPLOYMENT = os.getenv("EMBEDDING_DEPLOYMENT")
-
-INDEX_PATH = Path("dora_index.faiss")
-CHUNKS_PATH = Path("dora_chunks.pkl")
-
-
-def create_client() -> OpenAI:
-    if not all(
-        [
-            AZURE_ENDPOINT,
-            AZURE_API_KEY,
-            CHAT_DEPLOYMENT,
-            EMBEDDING_DEPLOYMENT,
-        ]
-    ):
-        raise ValueError("Vérifie les informations présentes dans le fichier .env.")
-
-    return OpenAI(
-        api_key=AZURE_API_KEY,
-        base_url=f"{AZURE_ENDPOINT}/openai/v1/",
-    )
-
-
-@st.cache_resource
-def load_database():
-    if not INDEX_PATH.exists() or not CHUNKS_PATH.exists():
-        raise FileNotFoundError(
-            "La base documentaire est absente. Exécute d'abord build_database.py."
-        )
-
-    index = faiss.read_index(str(INDEX_PATH))
-
-    with open(CHUNKS_PATH, "rb") as file:
-        chunks = pickle.load(file)
-
-    return index, chunks
-
-
-def retrieve_passages(
-    question: str,
-    client: OpenAI,
-    index,
-    chunks,
-    number_of_results: int = 5,
-):
-    response = client.embeddings.create(
-        model=EMBEDDING_DEPLOYMENT,
-        input=question,
-    )
-
-    query_vector = np.array(
-        [response.data[0].embedding],
-        dtype="float32",
-    )
-
-    faiss.normalize_L2(query_vector)
-
-    _, positions = index.search(query_vector, number_of_results)
-
-    return [
-        chunks[position]
-        for position in positions[0]
-        if 0 <= position < len(chunks)
-    ]
-
-
-def generate_answer(question: str, passages: list[dict], client: OpenAI) -> str:
-    context = "\n\n".join(
-        f"[Page {passage['page']}]\n{passage['text']}"
-        for passage in passages
-    )
-
-    prompt = f"""
-Tu es un assistant spécialisé dans le règlement DORA.
-
-Réponds uniquement à partir des passages du livre fournis ci-dessous.
-
-Règles :
-- N'utilise aucune connaissance extérieure.
-- Si la réponse n'est pas présente dans les passages, réponds :
-  "Je ne trouve pas cette information dans le livre DORA."
-- Réponds clairement et simplement en français.
-- Mentionne les pages utilisées à la fin de la réponse.
-
-Question :
-{question}
-
-Passages du livre :
-{context}
-"""
-
-    response = client.responses.create(
-        model=CHAT_DEPLOYMENT,
-        input=prompt,
-    )
-
-    return response.output_text
-
+# ============================================================
+# CONFIGURATION DE LA PAGE
+# ============================================================
 
 st.set_page_config(
-    page_title="Assistant DORA",
+    page_title=APP_NAME,
     page_icon="📘",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.title("📘 Assistant DORA")
-st.write("Posez une question. La réponse sera basée uniquement sur le livre DORA.")
 
-try:
-    client = create_client()
-    index, chunks = load_database()
+# ============================================================
+# FONCTIONS UTILITAIRES
+# ============================================================
 
-    question = st.text_input(
-        "Votre question",
-        placeholder="Exemple : Quelles sont les exigences relatives aux tests de résilience ?",
+def load_css() -> None:
+    """Charge le fichier CSS personnalisé."""
+
+    if STYLE_PATH.exists():
+        st.markdown(
+            f"<style>{STYLE_PATH.read_text(encoding='utf-8')}</style>",
+            unsafe_allow_html=True,
+        )
+
+
+def reset_conversation() -> None:
+    """Réinitialise la conversation et l'historique."""
+
+    st.session_state.messages = []
+    st.session_state.question_history = []
+
+
+def stream_text(text: str):
+    """Affiche progressivement une réponse déjà générée."""
+
+    for word in text.split():
+        yield word + " "
+        time.sleep(0.015)
+
+
+def display_sources(passages: list[dict]) -> None:
+    """Affiche les références et les passages réellement récupérés."""
+
+    if not passages:
+        return
+
+    references = build_references(passages)
+
+    st.markdown("---")
+    st.markdown("### 📚 Références")
+
+    if references:
+        st.markdown(references)
+
+    with st.expander("Afficher les passages sources"):
+        for position, passage in enumerate(passages, start=1):
+            document = passage.get("document", "dora.pdf")
+            page = passage.get("page", "?")
+            score = passage.get("score")
+
+            st.markdown(
+                f"#### Source {position} — {document}, page {page}"
+            )
+
+            st.write(
+                passage.get(
+                    "text",
+                    "Aucun texte disponible.",
+                )
+            )
+
+                
+
+            st.divider()
+
+
+# ============================================================
+# INITIALISATION
+# ============================================================
+
+load_css()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "question_history" not in st.session_state:
+    st.session_state.question_history = []
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    if LOGO_PATH.exists():
+        st.image(
+            str(LOGO_PATH),
+            width=165,
+        )
+
+    st.markdown("## Assistant DORA")
+
+    st.caption(
+        "Azure OpenAI · RAG · FAISS · Streamlit"
     )
 
-    if st.button("Obtenir la réponse", type="primary"):
-        if not question.strip():
-            st.warning("Veuillez saisir une question.")
-        else:
-            with st.spinner("Recherche dans le livre DORA..."):
+    if st.button(
+        "➕ Nouvelle conversation",
+        use_container_width=True,
+    ):
+        reset_conversation()
+        st.rerun()
+
+    st.divider()
+
+    st.markdown("### Document")
+
+    if PDF_PATH.exists():
+        file_size_mb = PDF_PATH.stat().st_size / (
+            1024 * 1024
+        )
+
+        st.success(
+            f"✅ {PDF_PATH.name}"
+        )
+
+        st.caption(
+            f"Taille : {file_size_mb:.1f} Mo"
+        )
+    else:
+        st.error(
+            "Le fichier data/dora.pdf est absent."
+        )
+
+    if INDEX_PATH.exists() and CHUNKS_PATH.exists():
+        st.success(
+            "✅ Base vectorielle prête"
+        )
+    else:
+        st.warning(
+            "Exécutez python build_database.py"
+        )
+
+    st.divider()
+
+    top_k = st.slider(
+        "Nombre de passages recherchés",
+        min_value=3,
+        max_value=10,
+        value=5,
+        help=(
+            "Détermine combien de passages du livre "
+            "seront envoyés au modèle."
+        ),
+    )
+
+    st.divider()
+
+    st.markdown("### Historique")
+
+    if st.session_state.question_history:
+        for previous_question in reversed(
+            st.session_state.question_history[-10:]
+        ):
+            st.caption(
+                f"💬 {previous_question}"
+            )
+    else:
+        st.caption(
+            "Aucune question pour le moment."
+        )
+
+    st.divider()
+
+    st.caption(
+        "Réponses fondées uniquement sur le document chargé."
+    )
+
+
+# ============================================================
+# EN-TÊTE PRINCIPAL
+# ============================================================
+
+left_column, right_column = st.columns(
+    [4, 1],
+    vertical_alignment="center",
+)
+
+with left_column:
+
+    st.title("📘 Assistant DORA")
+
+    st.write(
+        "Posez une question sur le règlement DORA. "
+        "L’assistant recherche d’abord dans votre livre, "
+        "puis formule une réponse sourcée."
+    )
+
+with right_column:
+
+    st.metric(
+        label="Document",
+        value="DORA",
+        delta="Actif",
+    )
+
+st.divider()
+
+
+# ============================================================
+# APPLICATION PRINCIPALE
+# ============================================================
+
+try:
+
+    client = get_openai_client()
+
+    index, chunks = load_vectorstore()
+
+    # Message d'accueil
+    if not st.session_state.messages:
+
+        with st.chat_message("assistant"):
+
+            st.markdown(
+                """
+👋 **Bonjour !**
+
+Posez votre première question sur le règlement DORA.
+                """
+            )
+
+    # Affichage des anciens messages
+    for message in st.session_state.messages:
+
+        with st.chat_message(
+            message["role"]
+        ):
+
+            st.markdown(
+                message["content"]
+            )
+
+            if (
+                message["role"] == "assistant"
+                and message.get("sources")
+            ):
+                display_sources(
+                    message["sources"]
+                )
+
+    # Champ de saisie
+    question = st.chat_input(
+        "Posez votre question sur DORA…"
+    )
+
+    if question and question.strip():
+
+        clean_question = question.strip()
+
+        # Enregistrer la question
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "content": clean_question,
+            }
+        )
+
+        st.session_state.question_history.append(
+            clean_question
+        )
+
+        # Afficher la question
+        with st.chat_message("user"):
+
+            st.markdown(
+                clean_question
+            )
+
+        # Générer et afficher la réponse
+        with st.chat_message("assistant"):
+
+            with st.spinner(
+                "Recherche dans le livre DORA…"
+            ):
+
                 passages = retrieve_passages(
-                    question,
-                    client,
-                    index,
-                    chunks,
+                    question=clean_question,
+                    client=client,
+                    index=index,
+                    chunks=chunks,
+                    top_k=top_k,
                 )
 
                 answer = generate_answer(
-                    question,
-                    passages,
-                    client,
+                    question=clean_question,
+                    passages=passages,
+                    client=client,
                 )
 
-            st.subheader("Réponse")
-            st.write(answer)
+            st.write_stream(
+                stream_text(answer)
+            )
+
+            display_sources(
+                passages
+            )
+
+        # Enregistrer la réponse complète
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "sources": passages,
+            }
+        )
+
+        # Mise à jour immédiate de la sidebar
+        st.rerun()
+
+
+# ============================================================
+# GESTION DES ERREURS
+# ============================================================
 
 except Exception as error:
-    st.error(f"Erreur : {error}")
+
+    st.error(
+        f"Erreur : {error}"
+    )
+
+    st.info(
+        "Vérifiez le fichier .env, les déploiements Azure, "
+        "le fichier data/dora.pdf et les fichiers du dossier vectorstore."
+    )

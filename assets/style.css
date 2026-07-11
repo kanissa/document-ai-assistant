@@ -1,0 +1,71 @@
+/* ===== Général ===== */
+
+.main {
+    background-color: #fafafa;
+}
+
+.block-container {
+    padding-top: 2rem;
+    padding-bottom: 2rem;
+    max-width: 1200px;
+}
+
+/* ===== Sidebar ===== */
+
+section[data-testid="stSidebar"] {
+    background: #f8f9fc;
+    border-right: 1px solid #e5e7eb;
+}
+
+section[data-testid="stSidebar"] img {
+    border-radius: 16px;
+}
+
+/* ===== Titres ===== */
+
+h1 {
+    color: #0f172a;
+    font-weight: 700;
+}
+
+h2, h3 {
+    color: #1e3a8a;
+}
+
+/* ===== Boutons ===== */
+
+.stButton > button {
+    width: 100%;
+    border-radius: 12px;
+    background: #2563eb;
+    color: white;
+    border: none;
+    height: 45px;
+    font-weight: bold;
+}
+
+.stButton > button:hover {
+    background: #1d4ed8;
+}
+
+/* ===== Champ de saisie ===== */
+
+.stChatInput input {
+    border-radius: 18px !important;
+    border: 1px solid #d1d5db !important;
+}
+
+/* ===== Messages ===== */
+
+[data-testid="stChatMessage"] {
+    border-radius: 18px;
+    padding: 15px;
+    margin-bottom: 10px;
+    box-shadow: 0px 2px 8px rgba(0,0,0,0.05);
+}
+
+/* ===== Expander ===== */
+
+.streamlit-expanderHeader {
+    font-weight: bold;
+}
