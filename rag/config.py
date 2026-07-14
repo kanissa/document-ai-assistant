@@ -99,6 +99,16 @@ BOOKS = {
 
 },
 
+"dora_certification": {
+    "label": "DORA Certification",
+
+    "pdf": DATA_DIR / "dora_certification.pdf",
+
+    "index": VECTORSTORE_DIR / "dora_certification" / "index.faiss",
+
+    "chunks": VECTORSTORE_DIR / "dora_certification" / "chunks.pkl",
+},
+
 }
 
 
